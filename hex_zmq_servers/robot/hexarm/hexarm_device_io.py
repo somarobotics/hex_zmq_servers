@@ -169,6 +169,15 @@ def run_device_io(cfg: dict, state_name: str, cmd_name: str, stop_flag,
     # attach to the shmem slots the MAIN process created (owner=False)
     state_slot = H.ShmemSlot(state_name, H.STATE_LEN, owner=False)
     cmd_slot = H.ShmemSlot(cmd_name, H.CMD_LEN, owner=False)
+    # Model-telemetry slot (tau_ext/ee/wrench computed by the PARENT, non-RT).
+    # Attach fail-soft: absent slot (old parent / estimator off) -> None, and
+    # the publish below simply omits the model topics. No pinocchio here, ever.
+    model_slot = None
+    if cfg.get('model_slot'):
+        try:
+            model_slot = H.ShmemSlot(cfg['model_slot'], H.MODEL_LEN, owner=False)
+        except Exception:
+            model_slot = None
     print(f"\033[36m[device_io] up: arm+gripper, control_hz={cfg['control_hz']}, "
           f"pid feeds firmware watchdog on its own GIL\033[0m", flush=True)
 
@@ -337,7 +346,19 @@ def run_device_io(cfg: dict, state_name: str, cmd_name: str, stop_flag,
                 try:
                     # _sl[5] = receipt host_ts captured in the read loop before this
                     # queue; publish it verbatim rather than stamping send-time here.
+                    _tau = _ee = _wr = None
+                    if model_slot is not None:
+                        try:
+                            _mp = model_slot.read()
+                            # fresh within 0.5 s on the shared monotonic axis --
+                            # the estimator runs at 100 Hz, so staleness means
+                            # the parent worker died; drop to raw topics only.
+                            if _mp is not None and (time.monotonic() - _mp[0]) < 0.5:
+                                _mts, _tau, _ee, _wr = H.unpack_model(_mp)
+                        except Exception:
+                            _tau = _ee = _wr = None
                     pub.publish(pub_side, _sl[1], _sl[2], _sl[3], _sl[4],
+                                tau_ext=_tau, ee=_ee, ee_wrench=_wr,
                                 host_ts=_sl[5])
                 except Exception:
                     pass

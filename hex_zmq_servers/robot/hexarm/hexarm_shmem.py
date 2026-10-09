@@ -67,6 +67,26 @@ CMD_LEN = _CMD_HDR + 6 * MAX_DOF
 
 _SEQLOCK_RETRIES = 8
 
+# Model-telemetry slot (main process WRITES, device-io pub ATTACHES):
+# [host_ts, tau_ext(7), ee_pose(7), wrench(6)] — tau_ext mirrors the sim wire
+# shape (eff copy, arm joints gravity-subtracted, gripper raw).
+MODEL_LEN = 1 + 7 + 7 + 6
+
+
+def pack_model(host_ts, tau_ext7, ee7, wrench6):
+    import numpy as _np
+    out = _np.empty(MODEL_LEN, dtype=_np.float64)
+    out[0] = float(host_ts)
+    out[1:8] = _np.asarray(tau_ext7, dtype=_np.float64).ravel()[:7]
+    out[8:15] = _np.asarray(ee7, dtype=_np.float64).ravel()[:7]
+    out[15:21] = _np.asarray(wrench6, dtype=_np.float64).ravel()[:6]
+    return out
+
+
+def unpack_model(payload):
+    return (float(payload[0]), payload[1:8].copy(),
+            payload[8:15].copy(), payload[15:21].copy())
+
 
 def _create(name: str, length: int) -> shared_memory.SharedMemory:
     size = length * np.dtype(np.float64).itemsize

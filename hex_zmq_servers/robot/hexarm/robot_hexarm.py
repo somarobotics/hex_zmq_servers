@@ -283,6 +283,12 @@ class HexRobotHexarm(HexRobotBase):
         self.__cmd_name = f"hexarm_cmd_{_uid}"
         self.__state_slot = SHM.ShmemSlot(self.__state_name, SHM.STATE_LEN, owner=True)
         self.__cmd_slot = SHM.ShmemSlot(self.__cmd_name, SHM.CMD_LEN, owner=True)
+        # Model-telemetry slot: THIS (non-RT) process computes tau_ext/ee/wrench
+        # at ~100 Hz and the device-io pub attaches the latest frame to its state
+        # publish — pinocchio never enters the RT process (the Aug rework's
+        # invariant; per-frame pinocchio in a publish path was the park root cause).
+        self.__model_name = f"hexarm_model_{_uid}"
+        self.__model_slot = SHM.ShmemSlot(self.__model_name, SHM.MODEL_LEN, owner=True)
         self.__cmd_seq = 0
         self.__io_cfg = {
             "device_ip": device_ip, "device_port": device_port,
@@ -306,6 +312,7 @@ class HexRobotHexarm(HexRobotBase):
             # #6 opt: state PUB runs in the device-io (RT-steady); pass it down.
             "pub_port": self.__pub_port,
             "side": self.__pub_side,
+            "model_slot": self.__model_name,
             "device_io_rt_prio": int(robot_config.get("device_io_rt_prio", 20)),
             # R2 diagnostic (docs/developer/rt/state-rate-measurement.md). This was
             # documented as a config key and read by hexarm_device_io, but never
@@ -367,6 +374,48 @@ class HexRobotHexarm(HexRobotBase):
 
         # start work loop
         self._working.set()
+
+    def __start_model_worker(self):
+        """Non-RT ~100 Hz tau_ext/ee_pose/wrench estimator -> model shmem slot.
+
+        Fail-soft by design: ANY init error (pinocchio missing, URDF issue)
+        logs once and leaves the topics off; pos/vel/eff publishing in the
+        device-io process is untouched. Compute runs unconditionally (no
+        subscriber gate -- the XPUB lives in the other process); one RNEA+FK
+        per 10 ms in a non-RT thread is noise.
+        """
+        import threading as _threading
+        import time as _time
+        try:
+            from ..ee_fk import EEPoseFK
+            fk = EEPoseFK(gravity=self.__gravity_vec)
+        except Exception as e:
+            print(f"\033[93m[hexarm] model topics off (ee_fk init: {e}); "
+                  f"pos/vel/eff unaffected\033[0m", flush=True)
+            return
+        sign = self.__ee_wrench_sign
+        slot = self.__model_slot
+        get_states = self.__get_states
+
+        def _loop():
+            while self._working.is_set():
+                try:
+                    _ts, states = get_states()
+                    if states is not None:
+                        pos, eff = states[:, 0], states[:, 2]
+                        qa = pos[:6]
+                        tau = eff.astype(float).copy()
+                        tau[:6] = eff[:6] - fk.gravity(qa)
+                        ee = fk.compute(qa)
+                        wr = fk.wrench(qa, tau[:6], sign=sign)
+                        slot.write(SHM.pack_model(_time.monotonic(), tau, ee, wr))
+                except Exception:
+                    pass                      # telemetry must never hurt control
+                _time.sleep(0.01)
+
+        _threading.Thread(target=_loop, name="model_pub", daemon=True).start()
+        print("\033[36m[hexarm] model topics on: tau_ext/ee_pose/wrench -> "
+              "device-io PUB (100 Hz estimator)\033[0m", flush=True)
 
     def work_loop(self, hex_queues: list[deque | threading.Event]):
         states_queue = hex_queues[0]
@@ -433,6 +482,7 @@ class HexRobotHexarm(HexRobotBase):
         # the latest frame (states.copy + notify, ~us).
         self.__pub_thread_on = ((bool(_os.environ.get("SODA_PUB_THREAD")) or _rt_on)
                                 and self.__state_pub is not None)
+        self.__start_model_worker()
         self.__pub_rt = _rt_on
         if self.__pub_thread_on:
             self.__pub_slot = None     # (tag, ts, states) — GIL-atomic latest-wins
