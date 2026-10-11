@@ -84,7 +84,8 @@ Each example has:
 ### Communication Protocol
 
 All requests/responses use this structure:
-- **Header** (JSON): `{"cmd": str, "ts": dict, "args": Any, "dtype": str, "shape": tuple}`
+- **Header** (JSON): `{"cmd": str, "ts": dict, "args": Any, "dtype": str, "shape": tuple}`,
+  plus `"host_ts": float` (the frame's monotonic receipt stamp) when the handler supplies one
 - **Buffer** (bytes): C-contiguous numpy array
 
 Sequence numbers prevent stale data (using modulo `1e12`).

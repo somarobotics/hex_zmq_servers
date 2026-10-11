@@ -278,6 +278,10 @@ class HexZMQServerBase(ABC):
                     "dtype": str(resp_buf.dtype),
                     "shape": tuple(resp_buf.shape),
                 }
+                # A frame's own receipt stamp (cam servers) rides next to ts;
+                # forward it only when the handler supplied one.
+                if "host_ts" in resp_hdr:
+                    send_hdr["host_ts"] = resp_hdr["host_ts"]
 
                 socket.send_multipart([
                     json.dumps(send_hdr).encode("utf-8"),
