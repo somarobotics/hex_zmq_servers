@@ -35,6 +35,11 @@ CAMERA_CONFIG = {
 
 class HexCamRealsense(HexCamBase):
 
+    # Consecutive wait_for_frames failures after which the camera counts as gone.
+    # A wait blocks up to librealsense's 5 s frame timeout, so this tolerates
+    # ~15 s of a stalled camera; a stopped pipeline fails instantly every time.
+    MAX_MISSED_WAITS = 3
+
     def __init__(
         self,
         camera_config: dict = CAMERA_CONFIG,
@@ -468,14 +473,28 @@ class HexCamRealsense(HexCamBase):
 
         rgb_count = 0
         depth_count = 0
+        missed = 0
         while self._working.is_set() and not stop_event.is_set():
             try:
                 aligned = self.__align.process(
                     self.__pipeline.wait_for_frames())
             except Exception as exc:
+                # After an unplug / USB reset librealsense stops the pipeline,
+                # and every later wait fails at once ("cannot be called before
+                # start()"); retrying here spun forever, writing that warning
+                # ~80 GB deep into one log while the camera stayed dead. A camera
+                # that misses MAX_MISSED_WAITS waits in a row is gone: end the
+                # process, and the launcher restarts it with a fresh device
+                # enumeration.
+                missed += 1
                 hex_log(HEX_LOG_LEVEL["warn"],
-                        f"wait_for_frames failed: {exc}")
+                        f"wait_for_frames failed ({missed}/{self.MAX_MISSED_WAITS}): {exc}")
+                if missed >= self.MAX_MISSED_WAITS:
+                    raise RuntimeError(
+                        f"RealSense {self.__serial_number}: no frames on {missed} "
+                        "consecutive waits; exiting for a restart") from exc
                 continue
+            missed = 0
 
             # RECEIPT stamp: wait_for_frames just returned this frame. time.monotonic()
             # to match the arm's host_ts clock; published verbatim by the PUB path.
