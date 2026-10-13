@@ -91,18 +91,16 @@ class HexCamRealsenseServer(HexCamServerBase):
         }, combined
 
     def _get_rgbd_imu(self, recv_hdr: dict):
-        """Return the latest RGB+Depth plus any buffered IMU samples since last call."""
+        """Return one capture's RGB+Depth plus any buffered IMU samples since last call."""
         try:
-            if self._realtime_mode:
-                rgb_f, depth_f = self._rgb_queue[-1], self._depth_queue[-1]
-            else:
-                rgb_f, depth_f = self._rgb_queue.popleft(), self._depth_queue.popleft()
-            rgb, depth = rgb_f.img, depth_f.img
-        except IndexError:
-            return {"cmd": "get_rgbd_imu_failed"}, None
+            pair = self._take_rgbd()
         except Exception as e:
             print(f"\033[91mget_rgbd_imu failed: {e}\033[0m")
             return {"cmd": "get_rgbd_imu_failed"}, None
+        if pair is None:
+            return {"cmd": "get_rgbd_imu_failed"}, None
+        rgb_f, depth_f = pair
+        rgb, depth = rgb_f.img, depth_f.img
 
         if getattr(self._device, "imu_enabled", lambda: False)():
             gyro, accel = self._device.drain_imu()

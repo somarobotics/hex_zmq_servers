@@ -256,6 +256,10 @@ class HexCamServerBase(HexZMQServerBase):
         self._device: HexDeviceBase = None
         self._rgb_queue = deque(maxlen=self._deque_maxlen)
         self._depth_queue = deque(maxlen=self._deque_maxlen)
+        # Serializes reads of the two queues across the worker threads: in FIFO
+        # mode _take_rgbd is a peek-then-pop over BOTH, which no other pop may
+        # interleave with.
+        self._rgbd_lock = threading.Lock()
 
     def __del__(self):
         HexZMQServerBase.__del__(self)
@@ -280,7 +284,8 @@ class HexCamServerBase(HexZMQServerBase):
 
         try:
             q = self._depth_queue if depth_flag else self._rgb_queue
-            frame = q[-1] if self._realtime_mode else q.popleft()
+            with self._rgbd_lock:
+                frame = q[-1] if self._realtime_mode else q.popleft()
         except IndexError:
             return {"cmd": f"{recv_hdr['cmd']}_failed"}, None
         except Exception as e:
@@ -300,25 +305,61 @@ class HexCamServerBase(HexZMQServerBase):
         else:
             return {"cmd": f"{recv_hdr['cmd']}_failed"}, None
 
+    def _take_rgbd(self):
+        """``(rgb_frame, depth_frame)`` of ONE capture, or None while none is complete.
+
+        Realtime mode peeks the newest complete capture; FIFO mode pops the
+        oldest one. The two queue heads are not a pair: a producer appends a
+        capture's color and its depth one after the other (the realsense loop
+        JPEG-publishes the color in between), so a request landing between the
+        two appends used to get this capture's color with the previous one's
+        depth -- and in FIFO mode it popped the color, failed on the empty depth
+        queue, and left every later reply one depth frame behind for good.
+
+        The halves of a capture share their receipt stamp (``host_ts``), so they
+        are matched on it, and nothing is consumed until both have arrived.
+        Unmatched frames ahead of the oldest complete capture can never be
+        completed (the producer skipped or the queue overflowed one half) and
+        are dropped in FIFO mode."""
+        with self._rgbd_lock:
+            if self._realtime_mode:
+                depth_of = {f.host_ts: f for f in tuple(self._depth_queue)}
+                for rgb_f in reversed(tuple(self._rgb_queue)):
+                    depth_f = depth_of.get(rgb_f.host_ts)
+                    if depth_f is not None:
+                        return rgb_f, depth_f
+                return None
+            while self._rgb_queue:
+                rgb_f = self._rgb_queue[0]
+                while self._depth_queue and self._depth_queue[0].host_ts < rgb_f.host_ts:
+                    self._depth_queue.popleft()
+                if not self._depth_queue:
+                    return None                      # this capture's depth is still coming
+                depth_f = self._depth_queue[0]
+                if depth_f.host_ts == rgb_f.host_ts:
+                    self._rgb_queue.popleft()
+                    self._depth_queue.popleft()
+                    return rgb_f, depth_f
+                self._rgb_queue.popleft()            # a newer depth exists: this one never will
+            return None
+
     def _get_rgbd(self, recv_hdr: dict):
-        """Get both RGB and depth frames together."""
+        """Get the RGB and depth frames of one capture together."""
         try:
-            # Get latest from both queues (they are pushed together by device)
-            rgb_f = self._rgb_queue[-1] if self._realtime_mode else self._rgb_queue.popleft()
-            depth_f = self._depth_queue[-1] if self._realtime_mode else self._depth_queue.popleft()
-        except IndexError:
-            return {"cmd": "get_rgbd_failed"}, None
+            pair = self._take_rgbd()
         except Exception as e:
             print(f"\033[91mget_rgbd failed: {e}\033[0m")
             return {"cmd": "get_rgbd_failed"}, None
+        if pair is None:
+            return {"cmd": "get_rgbd_failed"}, None
+        rgb_f, depth_f = pair
 
         # Pack RGB and depth into single buffer
         rgb_bytes = rgb_f.img.tobytes()
         depth_bytes = depth_f.img.tobytes()
         combined = np.frombuffer(rgb_bytes + depth_bytes, dtype=np.uint8)
 
-        # RGB and depth of one capture are pushed together and share a stamp;
-        # the rgb frame's is the pair's.
+        # Both frames are one capture (_take_rgbd), so they share their stamps.
         return {
             "cmd": "get_rgbd_ok",
             "ts": rgb_f.device_ts,
