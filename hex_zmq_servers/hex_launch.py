@@ -351,7 +351,9 @@ class HexLaunch:
             if logfile:
                 logfile.close()
 
-    def __start_node(self, node_cfg: dict):
+    def __start_node(self, node_cfg: dict, logs: tuple | None = None):
+        """Spawn one node. ``logs`` = the (info, err) log paths of the node's
+        previous run: a respawn appends to them instead of opening new files."""
         name = node_cfg.get("name", node_cfg.get("node_path"))
         env = os.environ.copy()
         env.update(node_cfg.get("env", {}) or {})
@@ -367,12 +369,11 @@ class HexLaunch:
             preexec_fn=os.setsid,
         )
 
-        log_path = Path(
-            f"{self.__log_dir}/info/{name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-        )
-        err_path = Path(
-            f"{self.__log_dir}/err/{name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-        )
+        if logs is None:
+            stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            logs = (Path(f"{self.__log_dir}/info/{name}_{stamp}.log"),
+                    Path(f"{self.__log_dir}/err/{name}_{stamp}.log"))
+        log_path, err_path = logs
         log_path.parent.mkdir(parents=True, exist_ok=True)
         err_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -390,6 +391,7 @@ class HexLaunch:
         return {
             "proc": proc,
             "threads": (log_thread, err_thread),
+            "logs": logs,
             "cfg": node_cfg
         }
 
@@ -419,12 +421,18 @@ class HexLaunch:
                             f"[launcher] Node {name} exited {proc.returncode}")
                         # Threads will stop automatically when stream ends
 
-                        if cfg_node.get("respawn"):
+                        # Never respawn into a shutdown (the stop event is set
+                        # before the children are signalled), including one that
+                        # begins during the respawn delay.
+                        respawn = (cfg_node.get("respawn")
+                                   and not self.__stop_event.is_set())
+                        if respawn:
                             delay = cfg_node.get("respawn_delay", 1)
                             print(
                                 f"[launcher] Respawning {name} in {delay}s...")
-                            time.sleep(delay)
-                            new_entry = self.__start_node(cfg_node)
+                            respawn = not self.__stop_event.wait(delay)
+                        if respawn:
+                            new_entry = self.__start_node(cfg_node, entry["logs"])
                             with self.__state_lock:
                                 self.__state[name] = new_entry
                         else:
@@ -441,6 +449,8 @@ class HexLaunch:
         self.__shutdown_called = True
 
         print(f"[launcher] Got signal {signame}, shutting down children...")
+        # First, so the monitor cannot respawn a child this shutdown stops.
+        self.__stop_event.set()
         with self.__state_lock:
             state_items = list(self.__state.items())
 
@@ -453,7 +463,6 @@ class HexLaunch:
                     proc.terminate()
                 except Exception:
                     pass
-        self.__stop_event.set()
         self.__restore_terminal_attrs()
 
     def run(self):
