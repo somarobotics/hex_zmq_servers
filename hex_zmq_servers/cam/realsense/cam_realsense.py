@@ -112,6 +112,9 @@ class HexCamRealsense(HexCamBase):
         # 4 -> 9; all consumers slice [0:4], so this is backward compatible.
         self.__intri = np.zeros(9)
 
+        # 1mm depth units, before any stream of this device starts (see below)
+        self.__force_depth_units()
+
         # open device
         self.__pipeline = rs.pipeline()
         config = rs.config()
@@ -181,7 +184,6 @@ class HexCamRealsense(HexCamBase):
             # device stays claimed and intrinsics come straight from it.
             # Behaviour is byte-equivalent to the pre-IMU version.
             profile = self.__pipeline.start(config)
-            self.__force_depth_units()
             color_profile = profile.get_stream(rs.stream.color)
             color_intrinsics = color_profile.as_video_stream_profile(
             ).get_intrinsics()
@@ -222,9 +224,18 @@ class HexCamRealsense(HexCamBase):
         D405 defaults to 0.1mm (0.0001 m/unit), so without this the cloud
         comes out 10x too far and gets pushed out of view / clipped.
         Setting it to 0.001 is a no-op on cameras already at 1mm.
+
+        Must run BEFORE the pipeline starts. Set on a running stream, the
+        option and every frame's get_units() read back 0.001 while the stream
+        keeps delivering 0.1mm data until its next start (D405 fw 5.15.1.55,
+        same scene: 12190 raw set mid-stream, 1217 set before start). The
+        device keeps the value until it power-cycles, so setting it after
+        start served 10x depth on the first start after every replug/reboot.
         """
         try:
-            dev = self.__pipeline.get_active_profile().get_device()
+            dev = next(d for d in rs.context().query_devices()
+                       if d.get_info(rs.camera_info.serial_number)
+                       == self.__serial_number)
             ds = dev.first_depth_sensor()
             before = ds.get_option(rs.option.depth_units) \
                 if ds.supports(rs.option.depth_units) else None
@@ -438,7 +449,6 @@ class HexCamRealsense(HexCamBase):
                 self.__imu_active = False
                 self.__config = self.__build_video_only_config()
                 self.__pipeline.start(self.__config)
-            self.__force_depth_units()
 
             while self._working.is_set() and not stop_event.is_set():
                 stop_event.wait(0.1)
